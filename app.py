@@ -4,18 +4,40 @@ import requests
 import inspect
 import pandas as pd
 
+
+from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
+from llama_index.core.agent import ReActAgent
+from llama_index.core.memory import ChatMemoryBuffer
+from dotenv import load_dotenv
+from llama_index.llms.gemini import Gemini
+from llama_index.embeddings.gemini import GeminiEmbedding
+
 # (Keep Constants as is)
 # --- Constants ---
-DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+load_dotenv()
+DEFAULT_API_URL = os.getenv("DEFAULT_API_URL")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+HF_KEY = os.getenv("HF_KEY")
+memory = ChatMemoryBuffer.from_defaults()
+# --- LLM ---
+
+llm_model = Gemini(model_name="models/gemini-2.0-flash-thinking-exp-01-21")
+
+
+# --- TOOLS ---
+tool_search = DuckDuckGoSearchToolSpec().to_tool_list()
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
 class BasicAgent:
     def __init__(self):
         print("BasicAgent initialized.")
+        self.agent = ReActAgent(tool_search, llm=llm_model, memory=memory ,verbose=True)
+
     def __call__(self, question: str) -> str:
         print(f"Agent received question (first 50 chars): {question[:50]}...")
-        fixed_answer = "This is a default answer."
+        fixed_answer = self.agent.chat(question).response
         print(f"Agent returning fixed answer: {fixed_answer}")
         return fixed_answer
 
