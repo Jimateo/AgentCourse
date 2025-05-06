@@ -3,45 +3,41 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
+import time
 
-
-from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
-from llama_index.core.agent import ReActAgent
-from llama_index.core.memory import ChatMemoryBuffer
 from dotenv import load_dotenv
-from llama_index.llms.gemini import Gemini
-from llama_index.embeddings.gemini import GeminiEmbedding
+
+from agent import agent
+
+load_dotenv()
 
 # (Keep Constants as is)
 # --- Constants ---
-load_dotenv()
 DEFAULT_API_URL = os.getenv("DEFAULT_API_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 HF_KEY = os.getenv("HF_KEY")
-memory = ChatMemoryBuffer.from_defaults()
-# --- LLM ---
-
-llm_model = Gemini(model_name="models/gemini-2.0-flash-thinking-exp-01-21")
-
-
-# --- TOOLS ---
-tool_search = DuckDuckGoSearchToolSpec().to_tool_list()
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
 class BasicAgent:
     def __init__(self):
         print("BasicAgent initialized.")
-        self.agent = ReActAgent(tool_search, llm=llm_model, memory=memory ,verbose=True)
-
-    def __call__(self, question: str) -> str:
+        self.agent = agent
+        
+    async def __call__(self, question: str) -> str:
         print(f"Agent received question (first 50 chars): {question[:50]}...")
-        fixed_answer = self.agent.chat(question).response
-        print(f"Agent returning fixed answer: {fixed_answer}")
-        return fixed_answer
+        try:
+            answer = await self.agent.run(question)
+            fixed_answer = str(answer).removeprefix("FINAL ANSWER:").removeprefix("FINAL ANSWER :").strip()
+            print(f"Agent returning fixed answer: {str(fixed_answer)}")
+            time.sleep(15)
+            return fixed_answer
+        except Exception as e:
+            print(f"Error in agent execution: {str(e)}")
+            return f"Error: {str(e)}"
 
-def run_and_submit_all( profile: gr.OAuthProfile | None):
+def run_and_submit_all(profile: gr.OAuthProfile | None):
     """
     Fetches all questions, runs the BasicAgent on them, submits all answers,
     and displays the results.
@@ -66,7 +62,8 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     except Exception as e:
         print(f"Error instantiating agent: {e}")
         return f"Error initializing agent: {e}", None
-    # In the case of an app running as a hugging Face space, this link points toward your codebase ( usefull for others so please keep it public)
+
+    # In the case of an app running as a hugging Face space, this link points toward your codebase
     agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
     print(agent_code)
 
@@ -95,6 +92,11 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
     results_log = []
     answers_payload = []
     print(f"Running agent on {len(questions_data)} questions...")
+    
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     for item in questions_data:
         task_id = item.get("task_id")
         question_text = item.get("question")
@@ -102,12 +104,14 @@ def run_and_submit_all( profile: gr.OAuthProfile | None):
             print(f"Skipping item with missing task_id or question: {item}")
             continue
         try:
-            submitted_answer = agent(question_text)
+            submitted_answer = loop.run_until_complete(agent(question_text))
             answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
         except Exception as e:
              print(f"Error running agent on task {task_id}: {e}")
              results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+    
+    loop.close()
 
     if not answers_payload:
         print("Agent did not produce any answers to submit.")
