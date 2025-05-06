@@ -1,41 +1,56 @@
 import os
 import gradio as gr
 import requests
-import inspect
 import pandas as pd
-import time
+import traceback
+import tempfile
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 
-from agent import agent
+from api_GAIA import ApiClienteGAIA
+
+from BasicAgent import BasicAgent
 
 load_dotenv()
 
 # (Keep Constants as is)
 # --- Constants ---
 DEFAULT_API_URL = os.getenv("DEFAULT_API_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 HF_KEY = os.getenv("HF_KEY")
 
 # --- Basic Agent Definition ---
 # ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
-class BasicAgent:
-    def __init__(self):
-        print("BasicAgent initialized.")
-        self.agent = agent
-        
-    async def __call__(self, question: str) -> str:
-        print(f"Agent received question (first 50 chars): {question[:50]}...")
+
+def save_task_file(file_content, task_id):
+    """
+    Save a task file to a temporary location
+    """
+    if not file_content:
+        return None
+    
+    # Create a temporary file
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, f"gaia_task_{task_id}.txt")
+    
+    # Write content to the file
+    try:
+        # Primero intentamos con UTF-8
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(file_content.decode('utf-8'))
+    except UnicodeDecodeError:
         try:
-            answer = await self.agent.run(question)
-            fixed_answer = str(answer).removeprefix("FINAL ANSWER:").removeprefix("FINAL ANSWER :").strip()
-            print(f"Agent returning fixed answer: {str(fixed_answer)}")
-            time.sleep(15)
-            return fixed_answer
+            # Si falla, intentamos con latin-1
+            with open(file_path, 'w', encoding='latin-1') as f:
+                f.write(file_content.decode('latin-1'))
         except Exception as e:
-            print(f"Error in agent execution: {str(e)}")
-            return f"Error: {str(e)}"
+            print(f"Error al guardar el archivo: {e}")
+            return None
+    
+    print(f"File saved to {file_path}")
+    return file_path
+
+
 
 def run_and_submit_all(profile: gr.OAuthProfile | None):
     """
@@ -52,9 +67,7 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         print("User not logged in.")
         return "Please Login to Hugging Face with the button.", None
 
-    api_url = DEFAULT_API_URL
-    questions_url = f"{api_url}/questions"
-    submit_url = f"{api_url}/submit"
+    api_url = ApiClienteGAIA(DEFAULT_API_URL)
 
     # 1. Instantiate Agent ( modify this part to create your agent)
     try:
@@ -68,49 +81,45 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     print(agent_code)
 
     # 2. Fetch Questions
-    print(f"Fetching questions from: {questions_url}")
     try:
-        response = requests.get(questions_url, timeout=15)
-        response.raise_for_status()
-        questions_data = response.json()
-        if not questions_data:
-             print("Fetched questions list is empty.")
-             return "Fetched questions list is empty or invalid format.", None
-        print(f"Fetched {len(questions_data)} questions.")
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching questions: {e}")
-        return f"Error fetching questions: {e}", None
-    except requests.exceptions.JSONDecodeError as e:
-         print(f"Error decoding JSON response from questions endpoint: {e}")
-         print(f"Response text: {response.text[:500]}")
-         return f"Error decoding server response for questions: {e}", None
+        questions_api = api_url.get_questions()
     except Exception as e:
-        print(f"An unexpected error occurred fetching questions: {e}")
-        return f"An unexpected error occurred fetching questions: {e}", None
-
+        error_details = traceback.format_exc()
+        print(f"Error fetching questions: {e}\n{error_details}")
+        return f"Error fetching questions: {e}", None
+    
     # 3. Run your Agent
     results_log = []
     answers_payload = []
-    print(f"Running agent on {len(questions_data)} questions...")
+    print(f"Running agent on {len(questions_api)} questions...")
     
     import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    for item in questions_data:
+    for item in questions_api:
         task_id = item.get("task_id")
         question_text = item.get("question")
         if not task_id or question_text is None:
             print(f"Skipping item with missing task_id or question: {item}")
             continue
         try:
-            submitted_answer = loop.run_until_complete(agent(question_text))
+            # Intentar descargar el archivo asociado si existe
+            file_path = None
+            try:
+                file_api = api_url.get_file(task_id)
+                print(f"Downloaded file for task {task_id}")
+                file_path = save_task_file(file_api, task_id)
+            except Exception as e:
+                print(f"No se pudo descargar el archivo para task_id {task_id}")
+
+            submitted_answer = loop.run_until_complete(agent(question_text,file_path))
             answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
         except Exception as e:
-             print(f"Error running agent on task {task_id}: {e}")
-             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
-    
+            print(f"Error running agent on task {task_id}: {e}")
+            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+
     loop.close()
 
     if not answers_payload:
@@ -123,11 +132,15 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     print(status_update)
 
     # 5. Submit
-    print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
+    print(f"Submitting {len(answers_payload)} answers to: {api_url.get_url_submit()}")
     try:
-        response = requests.post(submit_url, json=submission_data, timeout=60)
-        response.raise_for_status()
-        result_data = response.json()
+
+        result_data = api_url.submit_answers(
+            username.strip(),
+            agent_code,
+            answers_payload
+        )
+    
         final_status = (
             f"Submission Successful!\n"
             f"User: {result_data.get('username')}\n"
@@ -219,4 +232,5 @@ if __name__ == "__main__":
     print("-"*(60 + len(" App Starting ")) + "\n")
 
     print("Launching Gradio Interface for Basic Agent Evaluation...")
+    demo.launch(debug=True, share=False)
     demo.launch(debug=True, share=False)

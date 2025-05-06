@@ -107,14 +107,6 @@ agent = FunctionAgent(
     system_prompt=SYS_PROMPT,
 )
 
-agent_wiki = FunctionAgent(
-    name="Wiki Only",
-    description="Search information on wikipedia",
-    tools=tool_search_wikipedia,
-    llm=llm_model,
-    system_prompt=SYS_PROMPT,
-)
-
 agent_youtube = FunctionAgent(
     name="Analyze youtube video",
     description="Analyze the transcription from a youtube video",
@@ -125,7 +117,7 @@ agent_youtube = FunctionAgent(
 
 # --- Workflow Setup ---
 workflow = AgentWorkflow(
-    agents=[agent, agent_youtube, agent_wiki],
+    agents=[agent, agent_youtube],
     root_agent="Search Tools",
 )
 
