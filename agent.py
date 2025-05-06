@@ -1,80 +1,138 @@
+# --- Imports ---
+# Standard library
 import os
-import pandas as pd
-import time
-import nest_asyncio
 import asyncio
 import re
-import tempfile
+import requests
 
+# Third-party libraries
+import pandas as pd
+from dotenv import load_dotenv
+from markdownify import markdownify
 from youtube_transcript_api import YouTubeTranscriptApi
+
+# LlamaIndex imports
 from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
-from llama_index.core.agent.workflow import ReActAgent, FunctionAgent
+from llama_index.tools.wikipedia import WikipediaToolSpec
+from llama_index.core.agent.workflow import FunctionAgent, AgentWorkflow
 from llama_index.core.tools import FunctionTool
 from llama_index.readers.youtube_transcript import YoutubeTranscriptReader
 from llama_index.readers.whisper import WhisperReader
-
 from llama_index.core.memory import ChatMemoryBuffer
-from dotenv import load_dotenv
-from llama_index.llms.gemini import Gemini
+from llama_index.llms.google_genai import GoogleGenAI
 
-
-nest_asyncio.apply()
+# --- Environment Setup ---
 load_dotenv()
 
-# (Keep Constants as is)
 # --- Constants ---
 DEFAULT_API_URL = os.getenv("DEFAULT_API_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 HF_KEY = os.getenv("HF_KEY")
 
-memory = ChatMemoryBuffer.from_defaults()
+# --- System Prompt ---
+SYS_PROMPT = """You are a concise assistant. Your ONLY task is to provide the exact answer to the question.
+IMPORTANT RULES:
+1. Your response MUST start with "FINAL ANSWER: "
+2. After "FINAL ANSWER: " you MUST ONLY provide:
+   - A single number (no words, no units, no commas)
+   - OR a single word/phrase (no articles, no explanations)
+   - OR a comma-separated list of numbers/words (no additional text)
+3. DO NOT add any explanations, thoughts, or additional text
+4. DO NOT use articles or abbreviations
+5. DO NOT use units unless specifically requested
 
-SYS_PROMPT = "You are a helpful assistant tasked with answering questions using a set of tools. Now, I will ask you a question. Report your thoughts, and finish your answer with the following template: FINAL ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as few words as possible OR a comma separated list of numbers and/or strings. If you are asked for a number, don't use comma to write your number neither use units such as $ or percent sign unless specified otherwise. If you are asked for a string, don't use articles, neither abbreviations (e.g. for cities), and write the digits in plain text unless specified otherwise. If you are asked for a comma separated list, apply the above rules depending of whether the element to be put in the list is a number or a string.Your answer should only start with " + "FINAL ANSWER: " + ", then follows with the answer. If the answer is a number pls only respost with a number and not with a word"
+Example correct responses:
+FINAL ANSWER: 42
+FINAL ANSWER: Barcelona
+FINAL ANSWER: 1,2,3,4,5
+"""
 
-# --- LLM ---
-llm_model = Gemini(model_name="models/gemini-2.5-flash-preview-04-17")
+# --- LLM Configuration ---
+llm_model = GoogleGenAI(
+    model_name="models/gemini-2.0-flash",
+    api_key=GOOGLE_API_KEY,
+    temperature=0.1,
+    max_tokens=500
+)
 
+# --- Tool Definitions ---
+# File Operations Tools
 
-# --- TOOLS ---
-tool_search = DuckDuckGoSearchToolSpec().to_tool_list()
-
-# --- Nueva Tool para YouTube ---
+def visit_webpage(url: str) -> str:
+    """Visits a webpage at the given URL and returns its content as a markdown string."""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        markdown_content = markdownify(response.text).strip()
+        markdown_content = re.sub(r"\n{3,}", "\n\n", markdown_content)
+        return ' '.join(markdown_content.split()[:5000])
+    except requests.RequestException as e:
+        return f"Error fetching the webpage: {str(e)}"
+    except Exception as e:
+        return f"An unexpected error occurred: {str(e)}"
 
 def load_video_transcript(video_link: str) -> str:
-            try:
-                loader = YoutubeTranscriptReader()
-                documents = loader.load_data(
-                    ytlinks=[video_link]
-                )
+    """Loads transcript of the given video using the link."""
+    try:
+        loader = YoutubeTranscriptReader()
+        documents = loader.load_data(ytlinks=[video_link])
+        return {"video_transcript": documents[0].text_resource.text}
+    except Exception as e:
+        print("error", e)
 
-                text = documents[0].text_resource.text
-
-                return { "video_transcript": text }
-            except Exception as e:
-                print("error", e)
-
-
-
-
+# --- Tool Initialization ---
+visit_webpage_tool = FunctionTool.from_defaults(
+    visit_webpage,
+    name="visit_webpage",
+    description="Visits a webpage and returns its content as markdown."
+)
 
 load_video_transcript_tool = FunctionTool.from_defaults(
     load_video_transcript,
     name="load_video_transcript",
-    description="Loads transcript of the given video using the link.",
+    description="Loads transcript of the given video using the link."
 )
 
+# Search Tools
+tool_search_wikipedia = WikipediaToolSpec().to_tool_list()
+tool_search_duckduckgo = DuckDuckGoSearchToolSpec().to_tool_list()
+
+# --- Agent Definitions ---
 agent = FunctionAgent(
-    tools= tool_search + [load_video_transcript_tool],
-    llm = llm_model,
-    system_prompt= SYS_PROMPT,
+    name="Search Tools",
+    description="Search information on internet and wikipedia",
+    tools=tool_search_duckduckgo + [visit_webpage_tool],
+    llm=llm_model,
+    system_prompt=SYS_PROMPT,
 )
 
+agent_wiki = FunctionAgent(
+    name="Wiki Only",
+    description="Search information on wikipedia",
+    tools=tool_search_wikipedia,
+    llm=llm_model,
+    system_prompt=SYS_PROMPT,
+)
+
+agent_youtube = FunctionAgent(
+    name="Analyze youtube video",
+    description="Analyze the transcription from a youtube video",
+    tools=[load_video_transcript_tool],
+    llm=llm_model,
+    system_prompt=SYS_PROMPT,
+)
+
+# --- Workflow Setup ---
+workflow = AgentWorkflow(
+    agents=[agent, agent_youtube, agent_wiki],
+    root_agent="Search Tools",
+)
+
+# --- Main Execution ---
 async def main():
-    # Run the agent
-    response = await agent.run("Examine the video at https://www.youtube.com/watch?v=1htKBjuUWec.What does Teal'c say in response to the question ""Isn't that hot?""")
+    response = await workflow.run("How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.")
     print(str(response))
 
-# Run the agent
 if __name__ == "__main__":
     asyncio.run(main())
