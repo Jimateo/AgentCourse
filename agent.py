@@ -2,24 +2,25 @@
 # Standard library
 import os
 import asyncio
-import re
-import requests
+
 
 # Third-party libraries
 import pandas as pd
 from dotenv import load_dotenv
-from markdownify import markdownify
-from youtube_transcript_api import YouTubeTranscriptApi
+
 
 # LlamaIndex imports
 from llama_index.tools.duckduckgo import DuckDuckGoSearchToolSpec
-from llama_index.tools.wikipedia import WikipediaToolSpec
+from llama_index.readers.wikipedia import WikipediaReader 
 from llama_index.core.agent.workflow import FunctionAgent, AgentWorkflow
 from llama_index.core.tools import FunctionTool
 from llama_index.readers.youtube_transcript import YoutubeTranscriptReader
-from llama_index.readers.whisper import WhisperReader
-from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.core.schema import Document
+from llama_index.core.node_parser import SentenceSplitter
 
 # --- Environment Setup ---
 load_dotenv()
@@ -33,6 +34,7 @@ HF_KEY = os.getenv("HF_KEY")
 # --- System Prompt ---
 SYS_PROMPT = """You are a concise assistant. Your ONLY task is to provide the exact answer to the question.
 IMPORTANT RULES:
+0. If you are given data on a date or between two dates you have to be very precise
 1. Your response MUST start with "FINAL ANSWER: "
 2. After "FINAL ANSWER: " you MUST ONLY provide:
    - A single number (no words, no units, no commas)
@@ -53,24 +55,54 @@ llm_model = GoogleGenAI(
     model_name="models/gemini-2.0-flash",
     api_key=GOOGLE_API_KEY,
     temperature=0.1,
-    max_tokens=500
 )
 
 # --- Tool Definitions ---
 # File Operations Tools
 
-def visit_webpage(url: str) -> str:
-    """Visits a webpage at the given URL and returns its content as a markdown string."""
+
+
+def wikipedia_embed_retrieval(topic: str) -> dict:
+    """
+    Retrieves relevant Wikipedia chunks using Gemini embeddings.
+    """
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        markdown_content = markdownify(response.text).strip()
-        markdown_content = re.sub(r"\n{3,}", "\n\n", markdown_content)
-        return ' '.join(markdown_content.split()[:5000])
-    except requests.RequestException as e:
-        return f"Error fetching the webpage: {str(e)}"
+        loader = WikipediaReader()
+        documents = loader.load_data(pages=[topic])
+
+        if not documents:
+            return {"error": "No Wikipedia article found"}
+
+        # Usa Gemini para los embeddings
+        Settings.embed_model = GoogleGenAIEmbedding(
+            model_name="models/embedding-001",
+            api_key=GOOGLE_API_KEY
+        )
+
+        # Configurar el splitter de oraciones
+        text_splitter = SentenceSplitter(
+            chunk_size=512,
+            chunk_overlap=50
+        )
+
+        # Indexado y recuperación con chunks más pequeños para mejor precisión
+        index = VectorStoreIndex.from_documents(
+            documents,
+            transformations=[text_splitter]
+        )
+        retriever = index.as_retriever(similarity_top_k=3)
+        nodes = retriever.retrieve(topic)
+
+        # Combina los chunks más relevantes
+        relevant_chunks = "\n\n".join([n.text for n in nodes])
+        return {"wikipedia_chunks": relevant_chunks}
+
     except Exception as e:
-        return f"An unexpected error occurred: {str(e)}"
+        return {"error": str(e)}
+
+    
+
+
 
 def load_video_transcript(video_link: str) -> str:
     """Loads transcript of the given video using the link."""
@@ -82,48 +114,46 @@ def load_video_transcript(video_link: str) -> str:
         print("error", e)
 
 # --- Tool Initialization ---
-visit_webpage_tool = FunctionTool.from_defaults(
-    visit_webpage,
-    name="visit_webpage",
-    description="Visits a webpage and returns its content as markdown."
-)
-
 load_video_transcript_tool = FunctionTool.from_defaults(
     load_video_transcript,
     name="load_video_transcript",
-    description="Loads transcript of the given video using the link."
+    description=(
+        "Given a YouTube video URL, fetch and return the full transcript text "
+        "using the YouTube Transcript API."
+    )
+)
+
+wiki_retriever_tool = FunctionTool.from_defaults(
+    fn=wikipedia_embed_retrieval,
+    name="wikipedia_embed_retrieval",
+    description="Given a topic, retrieve the most relevant Wikipedia text chunks using embeddings"
 )
 
 # Search Tools
-tool_search_wikipedia = WikipediaToolSpec().to_tool_list()
 tool_search_duckduckgo = DuckDuckGoSearchToolSpec().to_tool_list()
 
 # --- Agent Definitions ---
 agent = FunctionAgent(
     name="Search Tools",
-    description="Search information on internet and wikipedia",
-    tools=tool_search_duckduckgo + [visit_webpage_tool],
+    description=(
+        "Performs web searches using DuckDuckGo, Wikipedia and retrieves YouTube video "
+        "transcripts to deliver comprehensive and accurate responses."
+    ),
+    tools=tool_search_duckduckgo+[load_video_transcript_tool,wiki_retriever_tool],
     llm=llm_model,
     system_prompt=SYS_PROMPT,
-)
 
-agent_youtube = FunctionAgent(
-    name="Analyze youtube video",
-    description="Analyze the transcription from a youtube video",
-    tools=[load_video_transcript_tool],
-    llm=llm_model,
-    system_prompt=SYS_PROMPT,
 )
 
 # --- Workflow Setup ---
 workflow = AgentWorkflow(
-    agents=[agent, agent_youtube],
+    agents=[agent],
     root_agent="Search Tools",
 )
 
 # --- Main Execution ---
 async def main():
-    response = await workflow.run("How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.")
+    response = await workflow.run('How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.')
     print(str(response))
 
 if __name__ == "__main__":
